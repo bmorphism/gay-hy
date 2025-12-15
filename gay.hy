@@ -1584,7 +1584,7 @@
   "Generate deterministic challenge index from seed + challenger + round.
    
    Challenger can verify response without storing challenges."
-  (let [challenge-seed (^ seed (fnv1a challenger-host) (* round GOLDEN))]
+  (let [challenge-seed (^ (^ seed (fnv1a challenger-host)) (* round GOLDEN))]
     (mix challenge-seed)))
 
 (defn compute-probe-response [seed index]
