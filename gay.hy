@@ -1561,3 +1561,217 @@
                     (print (.format "  XOR:   0x{:x}" combined-fp))
                     (print)
                     #(total-mined combined-fp total-rate)))))))))))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; COLLECTIVE MEMBERSHIP: Proof-of-Parallelism Voting
+;; ═══════════════════════════════════════════════════════════════════════════
+;;
+;; New machines must PROVE effective parallelism before joining:
+;; 1. Existing members issue random index challenges
+;; 2. Candidate must compute color_at(seed, challenge_index) correctly
+;; 3. Response time proves parallelism capability
+;; 4. Majority vote admits to collective
+;;
+;; "Correctly computing by accident" = can't fake, must actually compute
+;;
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(setv COLLECTIVE-PORT 42070)
+(setv PROBE-COUNT 10)
+(setv MAX-PROBE-TIME-MS 100)  ; Must respond within 100ms per probe
+
+(defn generate-challenge [seed challenger-host round]
+  "Generate deterministic challenge index from seed + challenger + round.
+   
+   Challenger can verify response without storing challenges."
+  (let [challenge-seed (^ seed (fnv1a challenger-host) (* round GOLDEN))]
+    (mix challenge-seed)))
+
+(defn compute-probe-response [seed index]
+  "Compute single color_at response for probe."
+  (color-at seed index))
+
+(defn verify-probe [seed index expected-color]
+  "Verify probe response matches expected."
+  (= (color-at seed index) expected-color))
+
+(defn issue-membership-probes [seed candidate-ip n-probes]
+  "Issue n random probes to candidate, measure response time.
+   
+   Returns: (passed, avg-time-ms, correct-count)"
+  (let [hostname (socket.gethostname)
+        sock (socket.socket socket.AF-INET socket.SOCK-DGRAM)
+        correct 0
+        total-time 0]
+    (sock.settimeout (/ MAX-PROBE-TIME-MS 1000))
+    
+    (for [i (range n-probes)]
+      (let [challenge-idx (generate-challenge seed hostname i)
+            expected (color-at seed challenge-idx)
+            msg (.encode (json.dumps {"g" "probe" "s" seed "i" challenge-idx "r" i}))
+            t0 (time.perf-counter)]
+        (try
+          (sock.sendto msg #(candidate-ip COLLECTIVE-PORT))
+          (let [#(data _) (sock.recvfrom 1024)
+                response (json.loads (.decode data))
+                t1 (time.perf-counter)
+                elapsed-ms (* (- t1 t0) 1000)]
+            (when (and (= (get response "g") "probe-resp")
+                       (= (get response "c") expected))
+              (setv correct (+ correct 1))
+              (setv total-time (+ total-time elapsed-ms))))
+          (except [e Exception] None))))
+    (sock.close)
+    
+    (let [passed (and (>= correct (// n-probes 2))
+                      (< (/ total-time (max correct 1)) MAX-PROBE-TIME-MS))
+          avg-time (if (> correct 0) (/ total-time correct) 999)]
+      #(passed avg-time correct))))
+
+(defn run-probe-responder [seed timeout]
+  "Listen for probes and respond with computed colors.
+   
+   Proves parallelism capability by fast correct responses."
+  (let [sock (socket.socket socket.AF-INET socket.SOCK-DGRAM)
+        responded 0]
+    (sock.setsockopt socket.SOL-SOCKET socket.SO-REUSEADDR 1)
+    (sock.setblocking False)
+    (try
+      (sock.bind #("" COLLECTIVE-PORT))
+      (let [end (+ (time.time) timeout)]
+        (while (< (time.time) end)
+          (try
+            (let [#(data addr) (sock.recvfrom 1024)
+                  msg (json.loads (.decode data))]
+              (when (= (get msg "g") "probe")
+                (let [idx (get msg "i")
+                      color (color-at (get msg "s") idx)
+                      resp (.encode (json.dumps {"g" "probe-resp" "c" color "r" (get msg "r")}))]
+                  (sock.sendto resp addr)
+                  (setv responded (+ responded 1)))))
+            (except [BlockingIOError] (time.sleep 0.001)))))
+      (except [e Exception] None))
+    (sock.close)
+    responded))
+
+(defn request-membership [seed existing-members]
+  "Request to join collective by proving parallelism.
+   
+   existing-members: list of (hostname, ip) tuples"
+  (let [hostname (socket.gethostname)
+        #(memory-gb gpu-cores bandwidth) (get-hardware-capability)
+        votes-needed (// (+ (len existing-members) 1) 2)  ; Majority
+        votes-received 0]
+    
+    (print)
+    (print "═══════════════════════════════════════════════════════════════")
+    (print "  COLLECTIVE MEMBERSHIP REQUEST")
+    (print "═══════════════════════════════════════════════════════════════")
+    (print)
+    (print (.format "  Candidate: {} ({} GB, {} cores)" hostname memory-gb gpu-cores))
+    (print (.format "  Existing members: {}" (len existing-members)))
+    (print (.format "  Votes needed: {}" votes-needed))
+    (print)
+    
+    ;; Broadcast capability and membership request
+    (let [sock (socket.socket socket.AF-INET socket.SOCK-DGRAM)
+          cap {"h" hostname "m" memory-gb "c" gpu-cores "b" bandwidth}
+          msg (.encode (json.dumps {"g" "membership-req" "cap" cap "seed" seed}))]
+      (sock.setblocking False)
+      (for [#(_ ip) existing-members]
+        (try (sock.sendto msg #(ip COLLECTIVE-PORT)) (except [e Exception] None)))
+      (sock.close))
+    
+    ;; Run probe responder to prove capability
+    (print "  Responding to probes...")
+    (let [responded (run-probe-responder seed 10)]
+      (print (.format "  Responded to {} probes" responded)))
+    
+    ;; Collect votes
+    (let [sock (socket.socket socket.AF-INET socket.SOCK-DGRAM)]
+      (sock.setsockopt socket.SOL-SOCKET socket.SO-REUSEADDR 1)
+      (sock.setblocking False)
+      (try
+        (sock.bind #("" COLLECTIVE-PORT))
+        (let [end (+ (time.time) 5)]
+          (while (< (time.time) end)
+            (try
+              (let [#(data addr) (sock.recvfrom 1024)
+                    msg (json.loads (.decode data))]
+                (when (and (= (get msg "g") "vote") 
+                          (= (get msg "candidate") hostname)
+                          (get msg "approve"))
+                  (setv votes-received (+ votes-received 1))
+                  (print (.format "    Vote from {}: APPROVE" (get msg "voter")))))
+              (except [BlockingIOError] (time.sleep 0.05)))))
+        (except [e Exception] None))
+      (sock.close))
+    
+    (print)
+    (if (>= votes-received votes-needed)
+      (do
+        (print "  ✓ MEMBERSHIP APPROVED")
+        True)
+      (do
+        (print (.format "  ✗ MEMBERSHIP DENIED ({}/{} votes)" votes-received votes-needed))
+        False))))
+
+(defn vote-on-candidate [seed candidate-ip timeout]
+  "Vote on candidate by issuing probes and verifying responses.
+   
+   Auto-approves if candidate proves effective parallelism."
+  (let [hostname (socket.gethostname)]
+    (print)
+    (print (.format "--- Probing candidate {} ---" candidate-ip))
+    
+    (let [#(passed avg-time correct) (issue-membership-probes seed candidate-ip PROBE-COUNT)]
+      (print (.format "  Probes: {}/{} correct, avg {:.1f}ms" correct PROBE-COUNT avg-time))
+      
+      (if passed
+        (do
+          (print "  Vote: APPROVE (proved parallelism)")
+          ;; Send approval vote
+          (let [sock (socket.socket socket.AF-INET socket.SOCK-DGRAM)
+                msg (.encode (json.dumps {"g" "vote" "voter" hostname 
+                                          "candidate" candidate-ip "approve" True}))]
+            (try (sock.sendto msg #(candidate-ip COLLECTIVE-PORT)) (except [e Exception] None))
+            (sock.close))
+          True)
+        (do
+          (print "  Vote: DENY (failed probes)")
+          False)))))
+
+(defn tripartite-collective [seed members]
+  "Create tripartite resource-aware collective.
+   
+   members: list of (hostname, memory-gb, gpu-cores, bandwidth)
+   
+   Assigns polarities and ranges for 3-MATCH."
+  (let [n (len members)
+        ;; Sort by capability score descending
+        scored (sorted members :key (fn [m] (- (capability-score (get m 1) (get m 2) (get m 3)))))
+        total-score (sum (lfor m scored (capability-score (get m 1) (get m 2) (get m 3))))
+        assignments []]
+    
+    (print)
+    (print "═══════════════════════════════════════════════════════════════")
+    (print "  TRIPARTITE COLLECTIVE - 3-MATCH Assignment")
+    (print "═══════════════════════════════════════════════════════════════")
+    (print)
+    
+    (setv start 0)
+    (for [#(i #(hostname mem cores bw)) (enumerate scored)]
+      (let [score (capability-score mem cores bw)
+            proportion (/ score total-score)
+            count (int (* proportion NASHPROP-TOTAL-SPACE))
+            polarity (% i 3)  ; MINUS, ERGODIC, PLUS round-robin by capability
+            twisted (u64 (^ seed (get TWISTS polarity)))]
+        (.append assignments 
+                 {"host" hostname "polarity" polarity "start" start "count" count
+                  "score" score "twisted" twisted})
+        (print (.format "  {} [{}]: {} colors ({:.1f}%) - polarity {}"
+                       hostname (get POLARITIES polarity) count (* proportion 100) polarity))
+        (setv start (+ start count))))
+    
+    (print)
+    assignments))
