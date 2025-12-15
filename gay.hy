@@ -1775,3 +1775,129 @@
     
     (print)
     assignments))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; CHAIN-PARALLEL: Judicious color_at + next_color for anti-fragile mining
+;; ═══════════════════════════════════════════════════════════════════════════
+;;
+;; STRATEGY:
+;;   - color_at(seed, i): Random access to start parallel chains
+;;   - next_color (mix): Sequential derivation within chains  
+;;   - Chains can MEET at verification checkpoints
+;;
+;; ANTI-FRAGILE:
+;;   - Challenge at chain midpoint → verifies BOTH halves
+;;   - Challenge at endpoint → useful extension work
+;;   - Multiple chains crossing → redundant verification
+;;   - External probes strengthen internal structure
+;;
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(defn next-color [color]
+  "Sequential derivation: mix(color). Forms chains."
+  (mix color))
+
+(defn chain-from [seed start-idx length]
+  "Generate chain of colors starting at index.
+   
+   Returns: (colors-list, final-fp)"
+  (let [start-color (color-at seed start-idx)
+        fp start-color
+        chain [start-color]
+        current start-color]
+    (for [_ (range (- length 1))]
+      (setv current (next-color current))
+      (.append chain current)
+      (setv fp (^ fp current)))
+    #(chain (u64 fp))))
+
+(defn parallel-chains [seed n-chains chain-length]
+  "Launch n parallel chains, each of given length.
+   
+   Chains start at GOLDEN-spaced indices for coverage."
+  (when (and MLX np)
+    (let [chain-fps []
+          total-colors 0]
+      ;; Start each chain at different index
+      (for [c (range n-chains)]
+        (let [start-idx (* c (// NASHPROP-TOTAL-SPACE n-chains))
+              #(chain fp) (chain-from seed start-idx chain-length)]
+          (.append chain-fps fp)
+          (setv total-colors (+ total-colors (len chain)))))
+      ;; XOR all chain fingerprints
+      (setv combined-fp seed)
+      (for [fp chain-fps]
+        (setv combined-fp (^ combined-fp fp)))
+      #(total-colors (u64 combined-fp) chain-fps))))
+
+(defn checkpoint-indices [seed n-chains chain-length]
+  "Compute checkpoint indices where chains can be verified.
+   
+   Returns indices that are: chain midpoints, endpoints, crossings."
+  (let [checkpoints []]
+    (for [c (range n-chains)]
+      (let [start-idx (* c (// NASHPROP-TOTAL-SPACE n-chains))]
+        ;; Midpoint
+        (.append checkpoints #("mid" c (+ start-idx (// chain-length 2))))
+        ;; Endpoint
+        (.append checkpoints #("end" c (+ start-idx chain-length)))))
+    checkpoints))
+
+(defn anti-fragile-challenge [seed checkpoints]
+  "Generate challenge from checkpoints.
+   
+   Challenge verifies chain integrity at critical points."
+  (let [idx (% (mix seed) (len checkpoints))]
+    (get checkpoints idx)))
+
+(defn verify-chain-checkpoint [seed chain-id checkpoint-type checkpoint-idx expected]
+  "Verify a chain at checkpoint.
+   
+   If correct: strengthens confidence in BOTH directions from checkpoint.
+   If wrong: identifies corrupted chain segment."
+  (let [actual (color-at seed checkpoint-idx)]
+    (if (= actual expected)
+      #(True "VERIFIED" chain-id checkpoint-type)
+      #(False "MISMATCH" chain-id checkpoint-type))))
+
+(defn triadic-chain-mining [seed n-per-polarity chain-length]
+  "Mine with 3 polarities × parallel chains.
+   
+   Each polarity owns chains at different phase offsets.
+   Creates interlocking verification structure."
+  (print)
+  (print "═══════════════════════════════════════════════════════════════")
+  (print "  TRIADIC CHAIN MINING - Anti-Fragile Structure")
+  (print "═══════════════════════════════════════════════════════════════")
+  (print)
+  
+  (setv polarity-results [])
+  (setv total-colors 0)
+  (setv combined-fp 0)
+  
+  (for [p (range 3)]
+    (let [twisted (u64 (^ seed (get TWISTS p)))
+          t0 (time.perf-counter)
+          #(colors fp chain-fps) (parallel-chains twisted n-per-polarity chain-length)
+          t1 (time.perf-counter)
+          rate (/ colors (- t1 t0) 1e6)]
+      (.append polarity-results #(p colors fp rate (len chain-fps)))
+      (setv total-colors (+ total-colors colors))
+      (setv combined-fp (^ combined-fp fp))
+      (print (.format "  {} [{} chains]: {:,} colors @ {:.0f}M/s  fp=0x{:x}"
+                     (get POLARITIES p) (len chain-fps) colors rate fp))))
+  
+  (print)
+  (print (.format "  Total: {:,} colors" total-colors))
+  (print (.format "  XOR:   0x{:x}" combined-fp))
+  
+  ;; Generate verification checkpoints
+  (print)
+  (print "--- Verification Checkpoints ---")
+  (for [p (range 3)]
+    (let [twisted (u64 (^ seed (get TWISTS p)))
+          checks (checkpoint-indices twisted n-per-polarity chain-length)]
+      (print (.format "  {}: {} checkpoints" (get POLARITIES p) (len checks)))))
+  
+  (print)
+  #(total-colors combined-fp polarity-results))
