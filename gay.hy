@@ -1412,3 +1412,152 @@
 
 (when (= __name__ "__main__")
   (main))
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;; DISTRIBUTED OCCUPANCY: Resource-Aware Parallel Color Mining
+;; ═══════════════════════════════════════════════════════════════════════════
+
+(defn discover-and-mine [seed timeout]
+  "Discover peers, create resource-aware bundle, mine together."
+  (let [hostname (socket.gethostname)
+        #(memory-gb gpu-cores bandwidth) (get-hardware-capability)
+        my-score (capability-score memory-gb gpu-cores bandwidth)
+        #(n-transducers batch-size optimal-total) (optimal-config memory-gb gpu-cores)]
+    
+    (print)
+    (print "═══════════════════════════════════════════════════════════════")
+    (print "  GAY DISTRIBUTED OCCUPANCY - Resource-Aware Mining")
+    (print "═══════════════════════════════════════════════════════════════")
+    (print)
+    (print (.format "  Local: {} ({} GB, {} cores, {} GB/s)" 
+                   hostname memory-gb gpu-cores bandwidth))
+    (print (.format "  Score: {} | Transducers: {} | Batch: {:,}"
+                   my-score n-transducers optimal-total))
+    (print)
+    
+    ;; Broadcast capability
+    (let [ts (tailscale-peers)
+          my-cap {"h" hostname "m" memory-gb "c" gpu-cores "b" bandwidth "s" my-score}]
+      (when ts
+        (let [#(self-ip peers) ts
+              sock (socket.socket socket.AF-INET socket.SOCK-DGRAM)
+              msg (.encode (json.dumps {"g" "cap" "d" my-cap "seed" seed}))]
+          (sock.setsockopt socket.SOL-SOCKET socket.SO-BROADCAST 1)
+          (sock.setblocking False)
+          (for [p peers]
+            (try (sock.sendto msg #((get p "ip") PORT)) (except [e Exception] None)))
+          (sock.close)
+          (print (.format "  Broadcast to {} peers" (len peers)))))
+      
+      ;; Listen for peer capabilities
+      (print "  Listening for peers...")
+      (let [sock (socket.socket socket.AF-INET socket.SOCK-DGRAM)
+            peer-caps {hostname my-cap}]
+        (sock.setsockopt socket.SOL-SOCKET socket.SO-REUSEADDR 1)
+        (sock.setblocking False)
+        (try
+          (sock.bind #("" PORT))
+          (let [end (+ (time.time) timeout)]
+            (while (< (time.time) end)
+              (try
+                (let [#(data addr) (sock.recvfrom 1024)
+                      m (json.loads (.decode data))]
+                  (when (and (= (get m "g" "") "cap") (= (get m "seed") seed))
+                    (let [d (get m "d")]
+                      (setv (get peer-caps (get d "h")) d)
+                      (print (.format "    Found: {} (score {})" 
+                                     (get d "h") (get d "s"))))))
+                (except [BlockingIOError] (time.sleep 0.05)))))
+          (except [e Exception] None))
+        (sock.close)
+        
+        ;; Create resource-weighted ranges
+        (print)
+        (print "--- Resource-Weighted Assignment ---")
+        (let [total-score (sum (lfor #(_ c) (.items peer-caps) (get c "s")))
+              sorted-peers (sorted (.items peer-caps) 
+                                   :key (fn [x] (fnv1a (get x 0))))
+              total-colors (* 1000000000 (len peer-caps))  ; 1B per peer baseline
+              assignments {}
+              start 0]
+          (for [#(h cap) sorted-peers]
+            (let [proportion (/ (get cap "s") total-score)
+                  count (int (* proportion total-colors))]
+              (setv (get assignments h) {"start" start "count" count 
+                                         "proportion" proportion})
+              (print (.format "  {}: [{:,}, {:,}) - {:.1f}%"
+                             h start (+ start count) (* proportion 100)))
+              (setv start (+ start count))))
+          
+          ;; Mine my portion
+          (print)
+          (print "--- Mining My Portion ---")
+          (let [my-assignment (get assignments hostname)
+                my-start (get my-assignment "start")
+                my-count (get my-assignment "count")]
+            (let [t0 (time.perf-counter)
+                  result (transducer-compose seed [(, my-start my-count)])
+                  t1 (time.perf-counter)]
+              (when result
+                (let [#(mined fp) result
+                      rate (/ mined (- t1 t0) 1e6)]
+                  (print (.format "  Mined: {:,} colors @ {:.2f} M/sec"
+                                 mined rate))
+                  (print (.format "  fp: 0x{:x}" fp))
+                  
+                  ;; Broadcast result
+                  (when ts
+                    (let [#(self-ip peers) ts
+                          sock (socket.socket socket.AF-INET socket.SOCKET-DGRAM)
+                          msg (.encode (json.dumps {"g" "result" "h" hostname 
+                                                    "seed" seed "fp" fp 
+                                                    "count" mined "rate" rate}))]
+                      (sock.setblocking False)
+                      (for [p peers]
+                        (try (sock.sendto msg #((get p "ip") PORT)) 
+                             (except [e Exception] None)))
+                      (sock.close)))
+                  
+                  ;; Collect peer results
+                  (print)
+                  (print "--- Collecting Results ---")
+                  (let [results {hostname {"fp" fp "count" mined "rate" rate}}
+                        sock (socket.socket socket.AF-INET socket.SOCK-DGRAM)]
+                    (sock.setsockopt socket.SOL-SOCKET socket.SO-REUSEADDR 1)
+                    (sock.setblocking False)
+                    (try
+                      (sock.bind #("" PORT))
+                      (let [end (+ (time.time) timeout)]
+                        (while (< (time.time) end)
+                          (try
+                            (let [#(data addr) (sock.recvfrom 1024)
+                                  m (json.loads (.decode data))]
+                              (when (and (= (get m "g" "") "result") 
+                                        (= (get m "seed") seed))
+                                (setv (get results (get m "h")) 
+                                      {"fp" (get m "fp") 
+                                       "count" (get m "count")
+                                       "rate" (get m "rate")})
+                                (print (.format "    {} fp=0x{:x} @ {:.0f}M/s"
+                                               (get m "h") (get m "fp") 
+                                               (get m "rate")))))
+                            (except [BlockingIOError] (time.sleep 0.05)))))
+                      (except [e Exception] None))
+                    (sock.close)
+                    
+                    ;; Combine fingerprints
+                    (print)
+                    (print "--- Combined Results ---")
+                    (setv combined-fp 0)
+                    (setv total-mined 0)
+                    (setv total-rate 0)
+                    (for [#(h r) (.items results)]
+                      (setv combined-fp (^ combined-fp (get r "fp")))
+                      (setv total-mined (+ total-mined (get r "count")))
+                      (setv total-rate (+ total-rate (get r "rate"))))
+                    (print (.format "  Peers: {}" (len results)))
+                    (print (.format "  Total: {:,} colors" total-mined))
+                    (print (.format "  Rate:  {:.2f} B/sec combined" (/ total-rate 1000)))
+                    (print (.format "  XOR:   0x{:x}" combined-fp))
+                    (print)
+                    #(total-mined combined-fp total-rate)))))))))))
