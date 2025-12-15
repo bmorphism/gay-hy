@@ -1496,7 +1496,7 @@
                 my-start (get my-assignment "start")
                 my-count (get my-assignment "count")]
             (let [t0 (time.perf-counter)
-                  result (transducer-compose seed [(, my-start my-count)])
+                  result (transducer-compose seed [(tuple [my-start my-count])])
                   t1 (time.perf-counter)]
               (when result
                 (let [#(mined fp) result
